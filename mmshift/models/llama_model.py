@@ -1,29 +1,35 @@
+"""LLaMA attention patches used by MM-ShiftKV runtime monkeypatching."""
+
+import math
+import time
+from typing import List, Optional, Tuple, Union
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import time
-from typing import List, Optional, Tuple, Union
-import torch.nn.functional as F
-import warnings
-from transformers.cache_utils import Cache, DynamicCache, StaticCache
+from flash_attn import flash_attn_varlen_func
+from transformers.cache_utils import Cache, StaticCache
+from transformers.modeling_outputs import BaseModelOutputWithPast
+from transformers.utils import logging
 
 from transformers.models.llama.modeling_llama import (
+    _flash_attention_forward,
     apply_rotary_pos_emb,
     repeat_kv,
-    _flash_attention_forward
 )
-from transformers.modeling_outputs import BaseModelOutputWithPast
-from transformers.utils import (
-    logging,
+
+from sparsemm.sparsemm_utils import (
+    DynamicCacheSplitHeadFlatten,
+    init_adakv,
+    init_mask,
+    init_pyramidkv,
+    init_snapkv,
+    init_sparsemm,
+    init_sparsemm_query,
 )
-from sparsemm.sparsemm_utils import init_snapkv, init_pyramidkv, init_adakv, init_sparsemm, init_mask,init_sparsemm_query
-import math
-from flash_attn import  flash_attn_varlen_func
-# from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input
-from sparsemm.sparsemm_utils import DynamicCacheSplitHeadFlatten
-import numpy as np
+
 torch.set_printoptions(sci_mode=False)
-import time
 
 # from sparsemm.qada_fused_triton import qada_mask_fused_triton
 # from sparsemm.qada_fused_triton import qada_mask_fused_triton_match_python
@@ -41,6 +47,7 @@ def llama_flash_attn2_forward_SnapKV(
     cache_position: Optional[torch.LongTensor] = None,
     position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.46
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+    """Run the SnapKV LLaMA attention path for prefill and decode."""
     if isinstance(past_key_value, StaticCache):
         raise ValueError(
             "`static` cache implementation is not compatible with `attn_implementation==flash_attention_2` "
@@ -153,6 +160,7 @@ def llama_flash_attn2_forward_PyramidKV(
     cache_position: Optional[torch.LongTensor] = None,
     position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.46
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+    """Run the PyramidKV LLaMA attention path with layer-adaptive budgets."""
     if isinstance(past_key_value, StaticCache):
         raise ValueError(
             "`static` cache implementation is not compatible with `attn_implementation==flash_attention_2` "
@@ -265,6 +273,7 @@ def llama_flash_attn2_forward_AdaKV(
     cache_position: Optional[torch.LongTensor] = None,
     position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.46
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+    """Run the AdaKV LLaMA attention path with head-adaptive cache sizes."""
     if isinstance(past_key_value, StaticCache):
         raise ValueError(
             "`static` cache implementation is not compatible with `attn_implementation==flash_attention_2` "
@@ -659,6 +668,8 @@ def attn_probs_this_step_fast(
     return out
 # @dataclass(frozen=True)
 class PrunedKV:
+    """Container for pruned KV tensors and their varlen metadata."""
+
     def __init__(self, key_states, value_states, cu_seqlens_k, max_seqlen_k, kept_idx_per_seq):
         self.key_states = key_states
         self.value_states = value_states
@@ -682,6 +693,7 @@ def llama_flash_attn2_forward_SparseMM(
     position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.46
      **kwargs,  # 👈 新增：接收任意额外参数
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+    """Run the SparseMM LLaMA attention path for both prefill and decode."""
     if isinstance(past_key_value, StaticCache):
         raise ValueError(
             "`static` cache implementation is not compatible with `attn_implementation==flash_attention_2` "
@@ -853,6 +865,7 @@ def llama_flash_attn2_forward_Mask(
     cache_position: Optional[torch.LongTensor] = None,
     position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.46
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+    """Run the head-masked LLaMA attention variant used for ablations."""
     if isinstance(past_key_value, StaticCache):
         raise ValueError(
             "`static` cache implementation is not compatible with `attn_implementation==flash_attention_2` "
@@ -1023,6 +1036,7 @@ def prepare_inputs_for_generation_llama_new(
         use_cache=True,
         **kwargs,
     ):
+        """Prepare LLaMA generation inputs while preserving custom cache objects."""
         if not isinstance(past_key_values, tuple):
             if len(past_key_values.key_cache) == 0:
                 for layer in self.model.layers:
@@ -1102,6 +1116,7 @@ def adaptive_LlamaModel_forward(
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
 ) -> Union[Tuple, BaseModelOutputWithPast]:
+    """Patched LLaMA model forward that accepts MM-ShiftKV cache implementations."""
     output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
     output_hidden_states = (
         output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states

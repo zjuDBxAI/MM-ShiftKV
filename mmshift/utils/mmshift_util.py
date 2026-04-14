@@ -1,32 +1,30 @@
 """Runtime cache, method-init, and analysis helpers for MM-ShiftKV."""
 
-import torch
-import time
-import torch.nn.functional as F
-import torch.nn as nn
+import json
 import math
 import os
-from typing import List
 import random
-import numpy as np
-import json
-import warnings
 from typing import List, Optional, Tuple
-from transformers.cache_utils import Cache
-import matplotlib.pyplot as plt
-from mmshift.utils.statistical_query_predictor import StatisticalQueryPredictor
-STATISTICAL_PREDICTOR_AVAILABLE = True
-# 导入统计表预测器模块
-# try:
-#     # import sys
-#     # sys.path.insert(0, '/data')
-#     from statistical_query_predictor import StatisticalQueryPredictor
-#     STATISTICAL_PREDICTOR_AVAILABLE = True
-# except ImportError:
-#     STATISTICAL_PREDICTOR_AVAILABLE = False
-#     print("[SparseMM] Statistical query predictor module not available")
 
-def plot_attention_head(attn_score: torch.Tensor, layer_idx: int, head_idx: int, topk: int = 20, save_path: str = None):
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from transformers.cache_utils import Cache
+
+from mmshift.utils.statistical_query_predictor import StatisticalQueryPredictor
+
+STATISTICAL_PREDICTOR_AVAILABLE = True
+
+
+def plot_attention_head(
+    attn_score: torch.Tensor,
+    layer_idx: int,
+    head_idx: int,
+    topk: int = 20,
+    save_path: str = None,
+):
     """
     可视化单个 head 的注意力分数。
     支持 attn_score 形状：
@@ -86,6 +84,7 @@ def plot_attention_head(attn_score: torch.Tensor, layer_idx: int, head_idx: int,
         print(f"Saved attention figure to {save_path}")
 
 def load_head_score(model_type):
+    """Load the per-head visual importance table for a given model family."""
     if 'llava' in model_type:
         if 'mistral' not in model_type:
             head_score_path = './visual_head/head_score/llava-v1.6.json'
@@ -99,6 +98,7 @@ def load_head_score(model_type):
         head_score = json.load(f)
     return head_score
 
+
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
     This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
@@ -107,11 +107,18 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     batch, num_key_value_heads, slen, head_dim = hidden_states.shape
     if n_rep == 1:
         return hidden_states
-    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
+    hidden_states = hidden_states[:, :, None, :, :].expand(
+        batch,
+        num_key_value_heads,
+        n_rep,
+        slen,
+        head_dim,
+    )
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
+
 def merge_kv(key_states, value_states, indices, window_size, merge):
-    # merge methods in LOOK-M
+    """Merge selected and dropped KV states using the requested merge strategy."""
 
     bsz, num_heads, k_len, head_dim = key_states.shape
 
@@ -120,14 +127,23 @@ def merge_kv(key_states, value_states, indices, window_size, merge):
     selected_values = value_states.gather(dim=2, index=indices)  # [bsz, num_heads, topk_len, head_dim]
 
     # kv-drop
-    all_indices = torch.arange(k_len, device=key_states.device).unsqueeze(0).unsqueeze(0).expand(bsz, num_heads, k_len)
+    all_indices = (
+        torch.arange(k_len, device=key_states.device)
+        .unsqueeze(0)
+        .unsqueeze(0)
+        .expand(bsz, num_heads, k_len)
+    )
     all_indices_flattened = all_indices.flatten()  # [bsz * num_heads * (k_len-window_size)]
     selected_indices_flattened = indices.flatten()  # [bsz * num_heads * topk_len]
     is_selected = torch.isin(all_indices_flattened, selected_indices_flattened)
     drop_indices_flattened = all_indices_flattened[~is_selected]
     drop_len = drop_indices_flattened.shape[0] // (all_indices.shape[0] * all_indices.shape[1])
-    drop_indices = drop_indices_flattened.reshape(all_indices.shape[0], all_indices.shape[1], drop_len) # [bsz * num_heads * (k_len-window_size-topk_len)]
-    drop_indices = drop_indices.unsqueeze(-1).expand(-1, -1, -1, head_dim)  # [bsz, num_heads, (k_len-window_size-topk_len), head_dim]
+    drop_indices = drop_indices_flattened.reshape(
+        all_indices.shape[0],
+        all_indices.shape[1],
+        drop_len,
+    )
+    drop_indices = drop_indices.unsqueeze(-1).expand(-1, -1, -1, head_dim)
     drop_keys = key_states.gather(dim=2, index=drop_indices)
     drop_values = value_states.gather(dim=2, index=drop_indices)
 
@@ -139,21 +155,40 @@ def merge_kv(key_states, value_states, indices, window_size, merge):
     k_hh_pruned = drop_keys  # [bsz, num_heads, k_len-topk_len-window_size, head_dim]
     k_hh_recent = torch.cat([recent_keys, selected_keys], dim=2)  # [bsz, num_heads, topk_len+window_size, head_dim]
     v_hh_pruned = drop_values  # [bsz, num_heads, k_len-topk_len-window_size, head_dim]
-    v_hh_recent = torch.cat([selected_values, value_states[:, :, -window_size:, :]], dim=2)  # [bsz, num_heads, topk_len+window_size, head_dim]
+    v_hh_recent = torch.cat(
+        [selected_values, value_states[:, :, -window_size:, :]],
+        dim=2,
+    )
     # similarity matrix
-    similarity = (k_hh_pruned / torch.norm(k_hh_pruned, dim=-1).unsqueeze(-1).repeat(1, 1, 1, 128)) @ ((k_hh_recent / (torch.norm(k_hh_recent, dim=-1).unsqueeze(-1).repeat(1, 1, 1, 128))).transpose(-1, -2)) # cosin
-    max_values, max_indices = similarity.max(dim=-1)
+    pruned_norm = torch.norm(k_hh_pruned, dim=-1).unsqueeze(-1).repeat(1, 1, 1, 128)
+    recent_norm = torch.norm(k_hh_recent, dim=-1).unsqueeze(-1).repeat(1, 1, 1, 128)
+    similarity = (k_hh_pruned / pruned_norm) @ ((k_hh_recent / recent_norm).transpose(-1, -2))
+    _, max_indices = similarity.max(dim=-1)
 
     # pivot merge
-    if merge=="pivot":
+    if merge == "pivot":
         print("Pivot merge")
         merged_indices = max_indices.unsqueeze(-1).repeat(1, 1, 1, 128)
         k_hh_selected = torch.gather(input=k_hh_recent, dim=2, index=merged_indices)
-        k_hh_merged = (k_hh_pruned + k_hh_selected)/2
-        k_hh_recent = torch.scatter_reduce(input=k_hh_recent, dim=2, index=merged_indices, src=k_hh_merged, reduce='mean', include_self=True) # include_self=True seems decrease the performance
+        k_hh_merged = (k_hh_pruned + k_hh_selected) / 2
+        k_hh_recent = torch.scatter_reduce(
+            input=k_hh_recent,
+            dim=2,
+            index=merged_indices,
+            src=k_hh_merged,
+            reduce='mean',
+            include_self=True,
+        )
         v_hh_selected = torch.gather(input=v_hh_recent, dim=2, index=merged_indices)
-        v_hh_merged = (v_hh_pruned + v_hh_selected)/2
-        v_hh_recent = torch.scatter_reduce(input=v_hh_recent, dim=2, index=merged_indices, src=v_hh_merged, reduce='mean', include_self=True)
+        v_hh_merged = (v_hh_pruned + v_hh_selected) / 2
+        v_hh_recent = torch.scatter_reduce(
+            input=v_hh_recent,
+            dim=2,
+            index=merged_indices,
+            src=v_hh_merged,
+            reduce='mean',
+            include_self=True,
+        )
     else:
         raise ValueError('Merge method not supported')
 
@@ -164,14 +199,14 @@ def merge_kv(key_states, value_states, indices, window_size, merge):
     return k_hh_recent, v_hh_recent
 
 class DynamicCacheSplitHeadFlatten(Cache):
-    '''
-    adapt from https://github.com/FFY0/AdaKV.
-    '''
-    def __init__(self) ->None:
+    """
+    Adapted flatten-cache implementation from https://github.com/FFY0/AdaKV.
+    """
+
+    def __init__(self) -> None:
         # Token wise List[]  Head wise KV List[torch.Tensor]
         super().__init__()
-        # print(self) qwen 改为28 llava 改为32
-        self.key_cache: List[Optional[torch.Tensor]] = [None] * 32 # 一开始将这个初始化为None
+        self.key_cache: List[Optional[torch.Tensor]] = [None] * 32
         self.value_cache: List[Optional[torch.Tensor]] = [None] * 32
 
         self._seen_tokens = 0
@@ -181,40 +216,43 @@ class DynamicCacheSplitHeadFlatten(Cache):
 
     def __iter__(self):
         for layer_idx in range(len(self)):
-            yield (tuple(self.key_cache[layer_idx]),tuple(self.value_cache[layer_idx]))
+            yield (tuple(self.key_cache[layer_idx]), tuple(self.value_cache[layer_idx]))
 
-    def __getitem__(self, layer_idx: int) -> Tuple[Tuple[torch.Tensor],Tuple[torch.Tensor]]:
+    def __getitem__(self, layer_idx: int) -> Tuple[Tuple[torch.Tensor], Tuple[torch.Tensor]]:
         if layer_idx < len(self):
-            return (tuple(self.key_cache[layer_idx]),tuple(self.value_cache[layer_idx]))
-        else:
-            raise KeyError(f"Cache only has {len(self)} layers, attempted to access layer with index {layer_idx}")
-    # 最后更新到这里
-    def update(self, key_states, value_states, layer_idx, cache_kwargs=None,up=False):
+            return (tuple(self.key_cache[layer_idx]), tuple(self.value_cache[layer_idx]))
+        raise KeyError(f"Cache only has {len(self)} layers, attempted to access layer with index {layer_idx}")
+
+    def update(self, key_states, value_states, layer_idx, cache_kwargs=None, up=False):
         kc = self.key_cache[layer_idx]
         if kc is None or (isinstance(kc, list) and len(kc) == 0):
             self.key_cache[layer_idx] = key_states
             self.value_cache[layer_idx] = value_states
             return self.key_cache[layer_idx], self.value_cache[layer_idx]
-        else:
-            kc = self.key_cache[layer_idx]
-            # print("DEBUG cache type:", layer_idx, type(kc), "len" if isinstance(kc, list) else "", (len(kc) if isinstance(kc, list) else ""))
 
-            assert self.key_cache[layer_idx].dim() == 2
-            bs, head, seqlen, dim = key_states.shape
-            assert bs == 1 and seqlen == 1
-            head_lens = cache_kwargs["head_lens"]
-            cu_klen = cache_kwargs["cu_klen"]
+        assert self.key_cache[layer_idx].dim() == 2
+        bs, head, seqlen, dim = key_states.shape
+        assert bs == 1 and seqlen == 1
+        head_lens = cache_kwargs["head_lens"]
+        cu_klen = cache_kwargs["cu_klen"]
 
-            # import nvtx
-            # copy_old_rng = nvtx.start_range("copy old")
-            from tiny_api_cuda import update_flatten_view
-            new_key_cache = update_flatten_view(self.key_cache[layer_idx].view(-1,dim), key_states.view(-1, dim), head_lens, cu_klen)
-            new_value_cache = update_flatten_view(self.value_cache[layer_idx].view(-1,dim), value_states.view(-1, dim), head_lens, cu_klen)
+        from tiny_api_cuda import update_flatten_view
 
-            # nvtx.end_range(copy_old_rng)
+        new_key_cache = update_flatten_view(
+            self.key_cache[layer_idx].view(-1, dim),
+            key_states.view(-1, dim),
+            head_lens,
+            cu_klen,
+        )
+        new_value_cache = update_flatten_view(
+            self.value_cache[layer_idx].view(-1, dim),
+            value_states.view(-1, dim),
+            head_lens,
+            cu_klen,
+        )
 
-            self.key_cache[layer_idx] = new_key_cache
-            self.value_cache[layer_idx] = new_value_cache
+        self.key_cache[layer_idx] = new_key_cache
+        self.value_cache[layer_idx] = new_value_cache
 
         return self.key_cache[layer_idx], self.value_cache[layer_idx]
 
@@ -251,8 +289,21 @@ class DynamicCacheSplitHeadFlatten(Cache):
         return cache
 
 class SnapKVCluster():
-    def __init__(self, window_size = 64, max_capacity_prompt = 256 + 64, kernel_size = 5, pooling = 'avgpool', layer_idx = None, num_hidden_layers = None, 
-                 pyram_mode = False, pyram_beta = 20,num_key_value_groups = 1, gqa_func='mean'):
+    """Prefix-compression policy used by SnapKV and PyramidKV."""
+
+    def __init__(
+        self,
+        window_size=64,
+        max_capacity_prompt=256 + 64,
+        kernel_size=5,
+        pooling='avgpool',
+        layer_idx=None,
+        num_hidden_layers=None,
+        pyram_mode=False,
+        pyram_beta=20,
+        num_key_value_groups=1,
+        gqa_func='mean',
+    ):
         self.window_size = window_size
         self.max_capacity_prompt = max_capacity_prompt
         assert self.max_capacity_prompt - self.window_size > 0
@@ -268,7 +319,7 @@ class SnapKVCluster():
         self.num_key_value_groups = num_key_value_groups
         self.gqa_func = gqa_func
 
-    def reset(self, window_size = 64, max_capacity_prompt = 256 + 64, kernel_size = 5, pooling = 'avgpool'):
+    def reset(self, window_size=64, max_capacity_prompt=256 + 64, kernel_size=5, pooling='avgpool'):
         self.window_size = window_size
         self.max_capacity_prompt = max_capacity_prompt
         assert self.max_capacity_prompt - self.window_size > 0
@@ -305,9 +356,16 @@ class SnapKVCluster():
 
         if q_len < self.max_capacity_prompt:
             return origin_key_states, origin_value_states
-        else:# 手动计算注意力
-            attn_weights = torch.matmul(query_states[..., -self.window_size:, :], key_states.transpose(2, 3)) / math.sqrt(head_dim)
-            mask = torch.full((self.window_size, self.window_size), torch.finfo(attn_weights.dtype).min, device=attn_weights.device)
+        else:
+            attn_weights = torch.matmul(
+                query_states[..., -self.window_size:, :],
+                key_states.transpose(2, 3),
+            ) / math.sqrt(head_dim)
+            mask = torch.full(
+                (self.window_size, self.window_size),
+                torch.finfo(attn_weights.dtype).min,
+                device=attn_weights.device,
+            )
             mask_cond = torch.arange(mask.size(-1), device=attn_weights.device)
             mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 0)
             mask = mask.to(attn_weights.device)
@@ -316,9 +374,13 @@ class SnapKVCluster():
             attn_weights[:, :, -self.window_size:, -self.window_size:] += attention_mask
 
             attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-            attn_weights_mean = attn_weights[:, :, -self.window_size:, : -self.window_size].mean(dim = -2)
-            
-            attn_weights_mean = attn_weights_mean.view(attn_weights_mean.shape[0], -1, self.num_key_value_groups, attn_weights_mean.shape[-1])
+            attn_weights_mean = attn_weights[:, :, -self.window_size:, : -self.window_size].mean(dim=-2)
+            attn_weights_mean = attn_weights_mean.view(
+                attn_weights_mean.shape[0],
+                -1,
+                self.num_key_value_groups,
+                attn_weights_mean.shape[-1],
+            )
             if self.gqa_func == 'max':
                 attn_weights_mean = attn_weights_mean.max(dim=-2).values
             elif self.gqa_func == 'mean':
@@ -327,9 +389,19 @@ class SnapKVCluster():
                 raise ValueError('gqa_func not supported')
                 
             if self.pooling == 'avgpool':
-                attn_cache = F.avg_pool1d(attn_weights_mean, kernel_size = self.kernel_size, padding=self.kernel_size//2, stride=1)
+                attn_cache = F.avg_pool1d(
+                    attn_weights_mean,
+                    kernel_size=self.kernel_size,
+                    padding=self.kernel_size // 2,
+                    stride=1,
+                )
             elif self.pooling == 'maxpool':
-                attn_cache = F.max_pool1d(attn_weights_mean, kernel_size = self.kernel_size, padding=self.kernel_size//2, stride=1)
+                attn_cache = F.max_pool1d(
+                    attn_weights_mean,
+                    kernel_size=self.kernel_size,
+                    padding=self.kernel_size // 2,
+                    stride=1,
+                )
             else:
                 raise ValueError('Pooling method not supported')
 
@@ -346,8 +418,24 @@ class SnapKVCluster():
             return key_states, value_states
 
 class AdaKVCluster():
-    def __init__(self, window_size = 32, kernel_size = 7, pooling = 'maxpool',base_capacity=None,floor_alpha = None,skip = None,normalize=None, 
-                 layer_idx = None, num_hidden_layers = None, pyram_mode = False, pyram_beta = 20, num_key_value_groups=1, gqa_func='mean'):
+    """Adaptive per-head budget allocator based on recent attention statistics."""
+
+    def __init__(
+        self,
+        window_size=32,
+        kernel_size=7,
+        pooling='maxpool',
+        base_capacity=None,
+        floor_alpha=None,
+        skip=None,
+        normalize=None,
+        layer_idx=None,
+        num_hidden_layers=None,
+        pyram_mode=False,
+        pyram_beta=20,
+        num_key_value_groups=1,
+        gqa_func='mean',
+    ):
         self.window_size = window_size
         self.kernel_size = kernel_size
         self.pooling = pooling
@@ -391,7 +479,12 @@ class AdaKVCluster():
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
         attn_weights_mean = attn_weights[:, :, -self.window_size:, : -self.window_size].mean(dim=-2)
 
-        attn_weights_mean = attn_weights_mean.view(attn_weights_mean.shape[0],num_heads//self.num_key_value_groups,self.num_key_value_groups,-1)
+        attn_weights_mean = attn_weights_mean.view(
+            attn_weights_mean.shape[0],
+            num_heads // self.num_key_value_groups,
+            self.num_key_value_groups,
+            -1,
+        )
         if self.gqa_func == 'max':
             attn_weights_mean = attn_weights_mean.max(dim=-2).values
         elif self.gqa_func == 'mean':
@@ -418,7 +511,7 @@ class AdaKVCluster():
         # check if prefix phase        assert key_states.shape[-2] == query_states.shape[-2]
         _device = key_states.device
         bsz, num_heads, q_len, head_dim = query_states.shape
-        attn_score= self.calcul_attn_sore(key_states,query_states)
+        attn_score = self.calcul_attn_sore(key_states, query_states)
         # import pdb; pdb.set_trace()
         origin_heads_key_states = torch.split(origin_key_states, 1, dim=1)
         origin_heads_value_states = torch.split(origin_value_states, 1, dim=1)
@@ -462,8 +555,18 @@ class AdaKVCluster():
                 [self.cu_qlen, torch.tensor([self.qlen_sum], dtype=torch.int32, device=_device)], dim=0)
             
             
-            self.cu_offset = torch.arange(0, num_heads//self.num_key_value_groups + 1, dtype=torch.int32, device=_device)
-            self.cu_head_offset = torch.arange(1, num_heads//self.num_key_value_groups +1, dtype=torch.int32, device=_device)
+            self.cu_offset = torch.arange(
+                0,
+                num_heads // self.num_key_value_groups + 1,
+                dtype=torch.int32,
+                device=_device,
+            )
+            self.cu_head_offset = torch.arange(
+                1,
+                num_heads // self.num_key_value_groups + 1,
+                dtype=torch.int32,
+                device=_device,
+            )
 
         if self.base_capacity > attn_score.size(-1):
             init_metadata(num_heads, [q_len] * (num_heads//self.num_key_value_groups), q_len * (num_heads//self.num_key_value_groups), q_len)
@@ -528,8 +631,24 @@ class AdaKVCluster():
         return heads_key_states, heads_value_states
 
 class SparseMM():
-    def __init__(self, window_size = 32, kernel_size = 7, pooling = 'maxpool', base_capacity=None, ratio=None, normalize=None, 
-                 layer_idx = None, num_hidden_layers = None, head_score=None, num_attention_heads=32, num_key_value_groups=1, gqa_func='mean', model_type=None):
+    """SparseMM cache compressor with head-wise capacity allocation."""
+
+    def __init__(
+        self,
+        window_size=32,
+        kernel_size=7,
+        pooling='maxpool',
+        base_capacity=None,
+        ratio=None,
+        normalize=None,
+        layer_idx=None,
+        num_hidden_layers=None,
+        head_score=None,
+        num_attention_heads=32,
+        num_key_value_groups=1,
+        gqa_func='mean',
+        model_type=None,
+    ):
         self.window_size = window_size
         self.kernel_size = kernel_size
         self.pooling = pooling
@@ -553,17 +672,28 @@ class SparseMM():
         self.gqa_func = gqa_func
 
         if head_score == 'random':
-            head_score_list = np.array([random.random() for _ in range(self.num_hidden_layers * self.num_attention_heads)])
+            head_score_list = np.array(
+                [random.random() for _ in range(self.num_hidden_layers * self.num_attention_heads)]
+            )
         elif head_score == 'visual':
             head_score = load_head_score(model_type)
             head_score_list = [np.mean(l[1]) for l in head_score.items()]
         head_score_list = torch.tensor(head_score_list / sum(head_score_list))
         # GQA support
-        self.score = head_score_list.view(self.num_hidden_layers, self.num_attention_heads//self.num_key_value_groups, self.num_key_value_groups)
+        self.score = head_score_list.view(
+            self.num_hidden_layers,
+            self.num_attention_heads // self.num_key_value_groups,
+            self.num_key_value_groups,
+        )
         self.score = self.score.sum(dim=-1)
 
         min_cache = int(self.base_capacity * self.ratio)
-        remain_capacity = (self.base_capacity - min_cache) * self.num_hidden_layers * self.num_attention_heads // self.num_key_value_groups
+        remain_capacity = (
+            (self.base_capacity - min_cache)
+            * self.num_hidden_layers
+            * self.num_attention_heads
+            // self.num_key_value_groups
+        )
         self.head_adaptive_capacity = torch.round(self.score * remain_capacity + min_cache).int()
         self.head_adaptive_capacity = torch.full(
             (self.num_hidden_layers, self.num_attention_heads // self.num_key_value_groups),
@@ -573,8 +703,8 @@ class SparseMM():
         )
 
                 # self.head_adaptive_capacity = self.base_capacity
-        self.head_adaptive_capacity_copy=torch.round(self.score * remain_capacity + min_cache).int()
-        # print(self.head_adaptive_capacity)
+        self.head_adaptive_capacity_copy = torch.round(self.score * remain_capacity + min_cache).int()
+
     def calcul_attn_sore(self, key_states, query_states):
         bsz, num_heads, q_len, head_dim = query_states.shape
         attn_weights = torch.matmul(query_states[..., -self.window_size:, :], key_states.transpose(2, 3)) / math.sqrt(
@@ -592,7 +722,12 @@ class SparseMM():
         
         attn_weights_mean = attn_weights[:, :, -self.window_size:, : -self.window_size].mean(dim=-2)
 
-        attn_weights_mean = attn_weights_mean.view(attn_weights_mean.shape[0],num_heads//self.num_key_value_groups,self.num_key_value_groups,-1)
+        attn_weights_mean = attn_weights_mean.view(
+            attn_weights_mean.shape[0],
+            num_heads // self.num_key_value_groups,
+            self.num_key_value_groups,
+            -1,
+        )
         if self.gqa_func == 'max':
             attn_weights_mean = attn_weights_mean.max(dim=-2).values
         elif self.gqa_func == 'mean':
@@ -699,8 +834,24 @@ class SparseMM():
         return heads_key_states, heads_value_states
 
 class ShiftKVCluster():
-    def __init__(self, window_size = 32, kernel_size = 7, pooling = 'maxpool', base_capacity=None, ratio=None, normalize=None,
-                 layer_idx = None, num_hidden_layers = None, head_score=None, num_attention_heads=32, num_key_value_groups=1, gqa_func='mean', model_type=None):
+    """ShiftKV cache compressor with optional learned statistical priors."""
+
+    def __init__(
+        self,
+        window_size=32,
+        kernel_size=7,
+        pooling='maxpool',
+        base_capacity=None,
+        ratio=None,
+        normalize=None,
+        layer_idx=None,
+        num_hidden_layers=None,
+        head_score=None,
+        num_attention_heads=32,
+        num_key_value_groups=1,
+        gqa_func='mean',
+        model_type=None,
+    ):
         self.window_size = window_size
         self.kernel_size = kernel_size
         self.pooling = pooling
@@ -740,11 +891,20 @@ class ShiftKVCluster():
             raise ValueError('head_score should be either "random" or "visual"')
         head_score_list = head_score_list / head_score_list.sum()
         # GQA support
-        self.score = head_score_list.view(self.num_hidden_layers, self.num_attention_heads//self.num_key_value_groups, self.num_key_value_groups)
+        self.score = head_score_list.view(
+            self.num_hidden_layers,
+            self.num_attention_heads // self.num_key_value_groups,
+            self.num_key_value_groups,
+        )
         self.score = self.score.sum(dim=-1)
 
         min_cache = int(self.base_capacity * self.ratio)
-        self.remain_capacity = (self.base_capacity - min_cache) * self.num_hidden_layers * self.num_attention_heads // self.num_key_value_groups
+        self.remain_capacity = (
+            (self.base_capacity - min_cache)
+            * self.num_hidden_layers
+            * self.num_attention_heads
+            // self.num_key_value_groups
+        )
         self.head_adaptive_capacity = torch.round(self.score * self.remain_capacity + min_cache).int()
         self.head_adaptive_capacity = torch.full(
             (self.num_hidden_layers, self.num_attention_heads // self.num_key_value_groups),
@@ -788,7 +948,13 @@ class ShiftKVCluster():
 
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
         attn_weights = attn_weights[:,:,:,:-1]
-        attn_weights = attn_weights.view(attn_weights.shape[0],num_heads//self.num_key_value_groups,self.num_key_value_groups,q_len,-1)
+        attn_weights = attn_weights.view(
+            attn_weights.shape[0],
+            num_heads // self.num_key_value_groups,
+            self.num_key_value_groups,
+            q_len,
+            -1,
+        )
 
         if self.gqa_func == 'max':# 每七个头聚合
             attn_weights_mean = attn_weights.max(dim=-3).values
@@ -858,19 +1024,37 @@ class ShiftKVCluster():
                 self.cu_qlen = torch.cumsum(self.layer_qlens, dim=0, dtype=torch.int32) - self.layer_qlens
                 self.cu_qlen = torch.cat(
                     [self.cu_qlen, torch.tensor([self.qlen_sum], dtype=torch.int32, device=_device)], dim=0)
-                self.cu_offset = torch.arange(0, num_heads//self.num_key_value_groups + 1, dtype=torch.int32, device=_device)
-                self.cu_head_offset = torch.arange(1, num_heads//self.num_key_value_groups + 1, dtype=torch.int32, device=_device)
+                self.cu_offset = torch.arange(
+                    0,
+                    num_heads // self.num_key_value_groups + 1,
+                    dtype=torch.int32,
+                    device=_device,
+                )
+                self.cu_head_offset = torch.arange(
+                    1,
+                    num_heads // self.num_key_value_groups + 1,
+                    dtype=torch.int32,
+                    device=_device,
+                )
 
 
             # 非0或1 层的。
-            attn_score = self.calcul_attn_sore(key_states,query_samples)  #[bsz,head,q_len,s_len]
-            #print(attn_score)
-            last_attn_score = self.calcul_attn_sore(key_states,query_states[...,-1:,:]) #[bsz,head,1,s_len]
+            attn_score = self.calcul_attn_sore(key_states, query_samples)  # [bsz, head, q_len, s_len]
+            last_attn_score = self.calcul_attn_sore(
+                key_states,
+                query_states[..., -1:, :],
+            )  # [bsz, head, 1, s_len]
             
 
             #优化代码-w
             score_bz, score_h, score_len,score_s = attn_score.shape
-            attn_score = attn_score.view(score_bz,score_h,score_len//groups_size,groups_size,score_s).sum(dim=-2)
+            attn_score = attn_score.view(
+                score_bz,
+                score_h,
+                score_len // groups_size,
+                groups_size,
+                score_s,
+            ).sum(dim=-2)
             attn_score = attn_score + last_attn_score
             attn_score = attn_score/(1.0+groups_size)
             sorted_scores, sorted_indices = attn_score.sort(dim=-1, descending=True)
@@ -890,19 +1074,15 @@ class ShiftKVCluster():
                 rangeL = torch.arange(L, device=idx_f.device).unsqueeze(0)       # [1, L]
                 mask_first_k = rangeL < k_f.unsqueeze(1)                         # [R, L]
                 sel = idx_f[mask_first_k]                                        # [sum_k]
-                row_offsets = (torch.arange(R, device=idx_f.device) * L)
-                off = torch.repeat_interleave(row_offsets, k_f)                   # [sum_k]
-                keys = sel + off                                                 # [sum_k]
-                counts = torch.bincount(keys, minlength=R * L).view(R, L)        # [R, L]
-                counts = counts.view(B, H, G, L).sum(dim=2).to(selected_num.dtype)  # [bsz,H,L]
+                row_offsets = torch.arange(R, device=idx_f.device) * L
+                off = torch.repeat_interleave(row_offsets, k_f)  # [sum_k]
+                keys = sel + off  # [sum_k]
+                counts = torch.bincount(keys, minlength=R * L).view(R, L)  # [R, L]
+                counts = counts.view(B, H, G, L).sum(dim=2).to(selected_num.dtype)
                 selected_num += counts
-            # 若所有 k 为 0，则不增加 selected_num
-            #=============
-            # 优化代码
-            #=============
 
             selected_num = selected_num + last_attn_score.squeeze(-2)
-            _, sorted_indices = selected_num.sort(dim=-1,descending=True)
+            _, sorted_indices = selected_num.sort(dim=-1, descending=True)
             final_sorted_indices = torch.split(sorted_indices, 1, dim=1)
 
 
@@ -921,20 +1101,22 @@ class ShiftKVCluster():
                 additional_budget = self.window_size - 1 
                 key_len = head_key.shape[-2] - 1
                 total_budget = min(max(original_budget + additional_budget, 0), key_len)
-                # total_budget = min(max(64, 0), key_len)
-                l = total_budget+1
+                l = total_budget + 1
                 k_lens.append(l)
                 max_seqlen_k = max(max_seqlen_k, l)
                 klen_sum += l
 
                 # 选择前total_budget个token 已经优化完成。
-                selected_token_indices = final_sorted_indices[head_idx][...,:total_budget]
+                selected_token_indices = final_sorted_indices[head_idx][..., :total_budget]
                 
                 # 5. 组装最终的key和value
-                selected_token_indices = selected_token_indices.sort()[0]  # 恢复原始顺序      #[bsz,1,slen]
+                selected_token_indices = selected_token_indices.sort()[0]  # 恢复原始顺序
                 selected_token_indices = selected_token_indices.view(1, 1, -1, 1).expand(-1, -1, -1, head_dim)
 
-                selected_keys = head_key[:, :, :-1, :].gather(dim=2, index=selected_token_indices)
+                selected_keys = head_key[:, :, :-1, :].gather(
+                    dim=2,
+                    index=selected_token_indices,
+                )
                 selected_values = head_value[:, :, :-1, :].gather(dim=2, index=selected_token_indices)
 
                 #6. 拼接选中的token和最后一个token
@@ -951,9 +1133,24 @@ class ShiftKVCluster():
             heads_value_states = torch.cat(heads_value_states, dim=0)
 
             return heads_key_states, heads_value_states
+
+
 class KeyDiffCluster():
-    def __init__(self, window_size = 15, max_capacity_prompt = 256 + 64, kernel_size = 5, pooling = 'avgpool', layer_idx = None, num_hidden_layers = None,
-                 pyram_mode = False, pyram_beta = 20,num_key_value_groups = 1, gqa_func='mean'):
+    """KeyDiff selector that keeps prefix tokens far from the anchor direction."""
+
+    def __init__(
+        self,
+        window_size=15,
+        max_capacity_prompt=256 + 64,
+        kernel_size=5,
+        pooling='avgpool',
+        layer_idx=None,
+        num_hidden_layers=None,
+        pyram_mode=False,
+        pyram_beta=20,
+        num_key_value_groups=1,
+        gqa_func='mean',
+    ):
         self.window_size = window_size
         self.max_capacity_prompt = max_capacity_prompt
         assert self.max_capacity_prompt - self.window_size > 0
@@ -970,7 +1167,7 @@ class KeyDiffCluster():
         self.gqa_func = gqa_func
 
 
-    def reset(self, window_size = 64, max_capacity_prompt = 256 + 64, kernel_size = 5, pooling = 'avgpool'):
+    def reset(self, window_size=64, max_capacity_prompt=256 + 64, kernel_size=5, pooling='avgpool'):
         self.window_size = window_size
         self.max_capacity_prompt = max_capacity_prompt
         assert self.max_capacity_prompt - self.window_size > 0
@@ -1012,6 +1209,7 @@ class KeyDiffCluster():
         return k_selected, v_selected
 
 def init_keydiff(self):
+    """Initialize the KeyDiff KV selector on an attention module once."""
     if not hasattr(self, "kv_cluster"):
         if not hasattr(self.config, 'window_size'):
             self.config.window_size = 32
@@ -1037,9 +1235,24 @@ def init_keydiff(self):
             num_key_value_groups = self.config.num_attention_heads // self.config.num_key_value_heads,
             gqa_func=self.config.gqa_func
         )
+
+
 class StreamingLLMCluster():
-    def __init__(self, window_size = 15, max_capacity_prompt = 256 + 64, kernel_size = 5, pooling = 'avgpool', layer_idx = None, num_hidden_layers = None,
-                 pyram_mode = False, pyram_beta = 20,num_key_value_groups = 1, gqa_func='mean'):
+    """StreamingLLM-style policy that preserves sink and trailing tokens."""
+
+    def __init__(
+        self,
+        window_size=15,
+        max_capacity_prompt=256 + 64,
+        kernel_size=5,
+        pooling='avgpool',
+        layer_idx=None,
+        num_hidden_layers=None,
+        pyram_mode=False,
+        pyram_beta=20,
+        num_key_value_groups=1,
+        gqa_func='mean',
+    ):
         self.window_size = window_size
         self.max_capacity_prompt = max_capacity_prompt
         assert self.max_capacity_prompt - self.window_size > 0
@@ -1056,7 +1269,7 @@ class StreamingLLMCluster():
         self.gqa_func = gqa_func
 
 
-    def reset(self, window_size = 64, max_capacity_prompt = 256 + 64, kernel_size = 5, pooling = 'avgpool'):
+    def reset(self, window_size=64, max_capacity_prompt=256 + 64, kernel_size=5, pooling='avgpool'):
         self.window_size = window_size
         self.max_capacity_prompt = max_capacity_prompt
         assert self.max_capacity_prompt - self.window_size > 0
@@ -1089,13 +1302,27 @@ class StreamingLLMCluster():
 
             self.max_capacity_prompt = max_num - self.layer_idx * steps + self.window_size
             self.pyram_init = True
-            print(f"Pyram mode adaptive capacity, layer: {self.layer_idx}, max_capacity_prompt: {self.max_capacity_prompt}, base_capacity: {self.max_capacity_prompt - self.window_size}", flush=True)
+            print(
+                (
+                    f"Pyram mode adaptive capacity, layer: {self.layer_idx}, "
+                    f"max_capacity_prompt: {self.max_capacity_prompt}, "
+                    f"base_capacity: {self.max_capacity_prompt - self.window_size}"
+                ),
+                flush=True,
+            )
 
         if q_len < self.max_capacity_prompt:
             return origin_key_states, origin_value_states
         else:
-            attn_weights = torch.matmul(query_states[..., -self.window_size:, :], key_states.transpose(2, 3)) / math.sqrt(head_dim)
-            mask = torch.full((self.window_size, self.window_size), torch.finfo(attn_weights.dtype).min, device=attn_weights.device)
+            attn_weights = torch.matmul(
+                query_states[..., -self.window_size:, :],
+                key_states.transpose(2, 3),
+            ) / math.sqrt(head_dim)
+            mask = torch.full(
+                (self.window_size, self.window_size),
+                torch.finfo(attn_weights.dtype).min,
+                device=attn_weights.device,
+            )
             mask_cond = torch.arange(mask.size(-1), device=attn_weights.device)
             mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 0)
             mask = mask.to(attn_weights.device)
@@ -1104,9 +1331,13 @@ class StreamingLLMCluster():
             attn_weights[:, :, -self.window_size:, -self.window_size:] += attention_mask
 
             attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-            attn_weights_mean = attn_weights[:, :, -self.window_size:, : -self.window_size].mean(dim = -2)
-            
-            attn_weights_mean = attn_weights_mean.view(attn_weights_mean.shape[0], -1, self.num_key_value_groups, attn_weights_mean.shape[-1])
+            attn_weights_mean = attn_weights[:, :, -self.window_size:, : -self.window_size].mean(dim=-2)
+            attn_weights_mean = attn_weights_mean.view(
+                attn_weights_mean.shape[0],
+                -1,
+                self.num_key_value_groups,
+                attn_weights_mean.shape[-1],
+            )
             if self.gqa_func == 'max':
                 attn_weights_mean = attn_weights_mean.max(dim=-2).values
             elif self.gqa_func == 'mean':
@@ -1115,9 +1346,19 @@ class StreamingLLMCluster():
                 raise ValueError('gqa_func not supported')
                 
             if self.pooling == 'avgpool':
-                attn_cache = F.avg_pool1d(attn_weights_mean, kernel_size = self.kernel_size, padding=self.kernel_size//2, stride=1)
+                attn_cache = F.avg_pool1d(
+                    attn_weights_mean,
+                    kernel_size=self.kernel_size,
+                    padding=self.kernel_size // 2,
+                    stride=1,
+                )
             elif self.pooling == 'maxpool':
-                attn_cache = F.max_pool1d(attn_weights_mean, kernel_size = self.kernel_size, padding=self.kernel_size//2, stride=1)
+                attn_cache = F.max_pool1d(
+                    attn_weights_mean,
+                    kernel_size=self.kernel_size,
+                    padding=self.kernel_size // 2,
+                    stride=1,
+                )
             else:
                 raise ValueError('Pooling method not supported')
             
@@ -1127,11 +1368,13 @@ class StreamingLLMCluster():
             k_window = origin_key_states[:, :, -num_windows:, :]
             v_window = origin_value_states[:, :, -num_windows:, :]
 
-            key_states = torch.cat([k_attention_sink, k_window], dim = 2)
-            value_states = torch.cat([v_attention_sink, v_window], dim = 2)
+            key_states = torch.cat([k_attention_sink, k_window], dim=2)
+            value_states = torch.cat([v_attention_sink, v_window], dim=2)
             return key_states, value_states
-        
+
+
 def init_streamingllm(self):
+    """Initialize the StreamingLLM KV selector on an attention module once."""
     if not hasattr(self, "kv_cluster"):
         if not hasattr(self.config, 'window_size'):
             self.config.window_size = 4
@@ -1158,6 +1401,7 @@ def init_streamingllm(self):
             gqa_func=self.config.gqa_func
         )
 def init_pyramidkv(self):
+    """Initialize the PyramidKV selector with layer-adaptive capacities."""
     if not hasattr(self, "kv_cluster"):
         if not hasattr(self.config, 'window_size'):
             self.config.window_size = 32
@@ -1189,6 +1433,7 @@ def init_pyramidkv(self):
         )
 
 def init_snapkv(self):
+    """Initialize the SnapKV selector on an attention module once."""
     if not hasattr(self, "kv_cluster"):
         if not hasattr(self.config, 'window_size'):
             self.config.window_size = 1
@@ -1216,6 +1461,7 @@ def init_snapkv(self):
         )
 
 def init_adakv(self):
+    """Initialize the AdaKV selector on an attention module once."""
     if not hasattr(self, "kv_cluster"):
         if not hasattr(self.config, 'window_size'):
             self.config.window_size = 32
@@ -1255,6 +1501,7 @@ def init_adakv(self):
         )
 
 def init_sparsemm(self):
+    """Initialize the SparseMM selector on an attention module once."""
     if not hasattr(self, "kv_cluster"):
         if not hasattr(self.config, 'window_size'):
             self.config.window_size = 32
@@ -1297,6 +1544,7 @@ def init_sparsemm(self):
         )
 
 def init_mask(self):
+    """Initialize the head-mask list used by the mask ablation path."""
     if not hasattr(self, "head_list"):
         method = os.getenv('METHOD', None)
 
@@ -1327,6 +1575,7 @@ def init_mask(self):
                 else:
                     self.head_list.append((l, h))
 def init_shiftkv(self):
+    """Initialize the ShiftKV selector on an attention module once."""
     if not hasattr(self, "kv_cluster"):
         if not hasattr(self.config, 'window_size'):
             self.config.window_size = 32
@@ -1373,7 +1622,7 @@ def init_shiftkv(self):
 
 
 class ExpectedAttentionCluster:
-    
+    """Expected-attention selector driven by query statistics over future positions."""
 
     def __init__(
         self,
@@ -1552,6 +1801,7 @@ class ExpectedAttentionCluster:
         new_values = origin_value_states.gather(2, topk_idx).contiguous()
         return new_keys, new_values
 def init_expected_attention(self):
+    """Initialize the expected-attention selector on an attention module once."""
     if not hasattr(self, "kv_cluster"):
         if not hasattr(self.config, "max_capacity_prompt"):
             self.config.max_capacity_prompt = int(os.getenv("BUDGET"))

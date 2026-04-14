@@ -1,23 +1,27 @@
+"""Mistral attention patches used by MM-ShiftKV runtime monkeypatching."""
+
 import inspect
-import math
+from typing import List, Optional, Tuple, Union
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List, Optional, Tuple, Union
-import warnings
 from transformers.cache_utils import Cache, DynamicCache, StaticCache
+from transformers.modeling_outputs import BaseModelOutputWithPast
+from transformers.utils import logging, is_flash_attn_2_available
+
 from transformers.models.mistral.modeling_mistral import (
     apply_rotary_pos_emb,
     repeat_kv,
 )
-from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_mask, _prepare_4d_causal_attention_mask_for_sdpa
-from transformers.modeling_outputs import BaseModelOutputWithPast
-from transformers.utils import (
-    logging,
-    is_flash_attn_2_available,
+from sparsemm.sparsemm_utils import (
+    DynamicCacheSplitHeadFlatten,
+    init_adakv,
+    init_mask,
+    init_pyramidkv,
+    init_snapkv,
+    init_sparsemm,
 )
-from sparsemm.sparsemm_utils import init_pyramidkv,init_snapkv, init_adakv, init_sparsemm, init_mask
-from sparsemm.sparsemm_utils import DynamicCacheSplitHeadFlatten
 
 if is_flash_attn_2_available():
     from flash_attn import flash_attn_func, flash_attn_varlen_func
@@ -40,6 +44,7 @@ def mistral_flash_attn2_forward_PyramidKV(
     use_cache: bool = False,
     cache_position: Optional[torch.LongTensor] = None,
 ):
+    """Run the PyramidKV Mistral attention path with layer-adaptive budgets."""
     if isinstance(past_key_value, StaticCache):
         raise ValueError(
             "`static` cache implementation is not compatible with `attn_implementation==flash_attention_2` "
@@ -162,6 +167,7 @@ def mistral_flash_attn2_forward_SnapKV(
     use_cache: bool = False,
     cache_position: Optional[torch.LongTensor] = None,
 ):
+    """Run the SnapKV Mistral attention path for prefill and decode."""
     if isinstance(past_key_value, StaticCache):
         raise ValueError(
             "`static` cache implementation is not compatible with `attn_implementation==flash_attention_2` "
@@ -284,6 +290,7 @@ def mistral_flash_attn2_forward_AdaKV(
     use_cache: bool = False,
     cache_position: Optional[torch.LongTensor] = None,
 ):
+    """Run the AdaKV Mistral attention path with head-adaptive budgets."""
     if isinstance(past_key_value, StaticCache):
         raise ValueError(
             "`static` cache implementation is not compatible with `attn_implementation==flash_attention_2` "
@@ -442,6 +449,7 @@ def mistral_flash_attn2_forward_SparseMM(
     use_cache: bool = False,
     cache_position: Optional[torch.LongTensor] = None,
 ):
+    """Run the SparseMM Mistral attention path for both prefill and decode."""
     if isinstance(past_key_value, StaticCache):
         raise ValueError(
             "`static` cache implementation is not compatible with `attn_implementation==flash_attention_2` "
@@ -600,6 +608,7 @@ def mistral_flash_attn2_forward_Mask(
     use_cache: bool = False,
     cache_position: Optional[torch.LongTensor] = None,
 ):
+    """Run the head-masked Mistral attention variant used for ablations."""
     init_mask(self)
     if isinstance(past_key_value, StaticCache):
         raise ValueError(
@@ -701,6 +710,7 @@ def adaptive_MistralModel_forward(
     return_dict: Optional[bool] = None,
     cache_position: Optional[torch.LongTensor] = None,
 ) -> Union[Tuple, BaseModelOutputWithPast]:
+    """Patched Mistral model forward that accepts MM-ShiftKV cache objects."""
     output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
     output_hidden_states = (
         output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -822,6 +832,7 @@ def prepare_inputs_for_generation_mistral_new(
     use_cache=True,
     **kwargs,
 ):
+    """Prepare Mistral generation inputs while preserving custom cache objects."""
     if not isinstance(past_key_values, tuple):
         if len(past_key_values.key_cache) == 0:
             for layer in self.model.layers:

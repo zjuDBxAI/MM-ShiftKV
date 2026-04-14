@@ -429,31 +429,66 @@ def forward(
         attn_weights = None
     return attn_output, attn_weights, past_key_value
 
-def replace_llama_attn_with_flash_attn():
-    """Install the Qwen2.5-VL flash-attention monkeypatch set."""
+
+def _warn_if_flash_attn_gpu_unsupported() -> None:
+    """Warn when flash-attention is being installed on unsupported GPUs."""
     cuda_major, _cuda_minor = torch.cuda.get_device_capability()
     if cuda_major < 8:
         warnings.warn(
             "Flash attention is only supported on A100 or H100 GPU during training due to head dim > 64 backward."
             "ref: https://github.com/HazyResearch/flash-attention/issues/190#issuecomment-1523349593"
         )
+
+
+def replace_llama_attn_with_flash_attn():
+    """Install the Qwen2.5-VL flash-attention monkeypatch set."""
+    _warn_if_flash_attn_gpu_unsupported()
     transformers.models.qwen2_5_vl.modeling_qwen2_5_vl.Qwen2_5_VLFlashAttention2.forward = forward
     transformers.models.qwen2_5_vl.modeling_qwen2_5_vl.Qwen2_5_VLForConditionalGeneration.forward = forwardllm
     transformers.models.qwen2_5_vl.modeling_qwen2_5_vl.Qwen2_5_VLModel.forward = forwardllm2
     transformers.models.qwen2_5_vl.modeling_qwen2_5_vl.Qwen2_5_VLDecoderLayer.forward = forwarddec
 
+
 def replace_llama_attn_with_flash_attnv2():
     """Install the older Qwen2-VL flash-attention monkeypatch set."""
-    cuda_major, _cuda_minor = torch.cuda.get_device_capability()
-    if cuda_major < 8:
-        warnings.warn(
-            "Flash attention is only supported on A100 or H100 GPU during training due to head dim > 64 backward."
-            "ref: https://github.com/HazyResearch/flash-attention/issues/190#issuecomment-1523349593"
-        )
+    _warn_if_flash_attn_gpu_unsupported()
     transformers.models.qwen2_vl.modeling_qwen2_vl.Qwen2VLFlashAttention2.forward = forward
     transformers.models.qwen2_vl.modeling_qwen2_vl.Qwen2VLForConditionalGeneration.forward = forwardllm
     transformers.models.qwen2_vl.modeling_qwen2_vl.Qwen2VLModel.forward = forwardllm2
     transformers.models.qwen2_vl.modeling_qwen2_vl.Qwen2VLDecoderLayer.forward = forwarddec
+
+
+def _install_qwen25_base_patchset() -> None:
+    """Install the common Qwen2.5-VL patch set shared by several methods."""
+    transformers.models.qwen2_5_vl.modeling_qwen2_5_vl.Qwen2_5_VLFlashAttention2.forward = forward
+    transformers.models.qwen2_5_vl.modeling_qwen2_5_vl.Qwen2_5_VLForConditionalGeneration.forward = forwardllm
+    transformers.models.qwen2_5_vl.modeling_qwen2_5_vl.Qwen2_5_VLModel.forward = forwardllm2
+    transformers.models.qwen2_5_vl.modeling_qwen2_5_vl.Qwen2_5_VLDecoderLayer.forward = forwarddec
+
+
+def _install_qwen2_base_patchset() -> None:
+    """Install the common legacy Qwen2-VL patch set shared by several methods."""
+    transformers.models.qwen2_vl.modeling_qwen2_vl.Qwen2VLModel.forward = adakv_qwen_forward
+    transformers.models.qwen2_vl.modeling_qwen2_vl.Qwen2VLFlashAttention2.forward = qwen_flash_attn2_forward_AdaKV
+
+
+def _install_qwen25_method_patch(attn_forward, model_forward=forwardllm2) -> None:
+    """Install the common Qwen2.5-VL patch set plus method-specific overrides."""
+    _install_qwen25_base_patchset()
+    transformers.models.qwen2_5_vl.modeling_qwen2_5_vl.Qwen2_5_VLFlashAttention2.forward = attn_forward
+    transformers.models.qwen2_5_vl.modeling_qwen2_5_vl.Qwen2_5_VLModel.forward = model_forward
+
+
+def _install_llama_generation_patch() -> None:
+    """Install the shared LLaMA generation helper patch."""
+    transformers.models.llama.modeling_llama.LlamaForCausalLM.prepare_inputs_for_generation = prepare_inputs_for_generation_llama_new
+
+
+def _install_mistral_generation_patch() -> None:
+    """Install the shared Mistral generation helper patch."""
+    transformers.models.mistral.modeling_mistral.MistralForCausalLM.prepare_inputs_for_generation = prepare_inputs_for_generation_mistral_new
+
+
 def replace_llama(method):
     """Apply a LLaMA monkeypatch for a named KV-cache method.
 
@@ -487,7 +522,7 @@ def replace_llama(method):
         transformers.models.llama.modeling_llama.LlamaFlashAttention2.forward = llama_flash_attn2_forward_Mask
 
     if method not in ["fullkv"]:
-        transformers.models.llama.modeling_llama.LlamaForCausalLM.prepare_inputs_for_generation = prepare_inputs_for_generation_llama_new
+        _install_llama_generation_patch()
 
 
 def replace_mistral(method):
@@ -521,7 +556,8 @@ def replace_mistral(method):
         transformers.models.mistral.modeling_mistral.MistralFlashAttention2.forward = mistral_flash_attn2_forward_Mask
 
     if method not in ["fullkv"]:
-        transformers.models.mistral.modeling_mistral.MistralForCausalLM.prepare_inputs_for_generation = prepare_inputs_for_generation_mistral_new
+        _install_mistral_generation_patch()
+
 
 def replace_qwen(method):
     """Apply a Qwen2.5-VL monkeypatch for a named KV-cache method.
@@ -533,50 +569,26 @@ def replace_qwen(method):
 
     if method == "streamingllm":
         print("Using streamingllm")
-
-        transformers.models.qwen2_5_vl.modeling_qwen2_5_vl.Qwen2_5_VLFlashAttention2.forward = forward
-        transformers.models.qwen2_5_vl.modeling_qwen2_5_vl.Qwen2_5_VLForConditionalGeneration.forward = forwardllm
-        transformers.models.qwen2_5_vl.modeling_qwen2_5_vl.Qwen2_5_VLModel.forward = forwardllm2
-        transformers.models.qwen2_5_vl.modeling_qwen2_5_vl.Qwen2_5_VLDecoderLayer.forward = forwarddec
-        transformers.models.qwen2_5_vl.modeling_qwen2_5_vl.Qwen2_5_VLFlashAttention2.forward = qwen_flash_attn2_forward_streamingllm
-    if method == "keydiff":
+        _install_qwen25_method_patch(qwen_flash_attn2_forward_streamingllm)
+    elif method == "keydiff":
         print("Using keydiff!")
-
-        transformers.models.qwen2_5_vl.modeling_qwen2_5_vl.Qwen2_5_VLFlashAttention2.forward = forward
-        transformers.models.qwen2_5_vl.modeling_qwen2_5_vl.Qwen2_5_VLForConditionalGeneration.forward = forwardllm
-        transformers.models.qwen2_5_vl.modeling_qwen2_5_vl.Qwen2_5_VLModel.forward = forwardllm2
-        transformers.models.qwen2_5_vl.modeling_qwen2_5_vl.Qwen2_5_VLDecoderLayer.forward = forwarddec
-        transformers.models.qwen2_5_vl.modeling_qwen2_5_vl.Qwen2_5_VLFlashAttention2.forward = qwen_flash_attn2_forward_keydiff
-    if method == "snapkv":
+        _install_qwen25_method_patch(qwen_flash_attn2_forward_keydiff)
+    elif method == "snapkv":
         print("Using SnapKV!")
-
-        transformers.models.qwen2_5_vl.modeling_qwen2_5_vl.Qwen2_5_VLFlashAttention2.forward = forward
-        transformers.models.qwen2_5_vl.modeling_qwen2_5_vl.Qwen2_5_VLForConditionalGeneration.forward = forwardllm
-        transformers.models.qwen2_5_vl.modeling_qwen2_5_vl.Qwen2_5_VLModel.forward = forwardllm2
-        transformers.models.qwen2_5_vl.modeling_qwen2_5_vl.Qwen2_5_VLDecoderLayer.forward = forwarddec
-        transformers.models.qwen2_5_vl.modeling_qwen2_5_vl.Qwen2_5_VLFlashAttention2.forward = qwen_flash_attn2_forward_SnapKV
-
+        _install_qwen25_method_patch(qwen_flash_attn2_forward_SnapKV)
     elif method == "pyramidkv":
         print("Using PyramidKV!")
         transformers.models.qwen2_vl.modeling_qwen2_vl.Qwen2VLFlashAttention2.forward = qwen_flash_attn2_forward_PyramidKV
-    
-    if method == "adakv":
+    elif method == "adakv":
         print("Using AdaKV!")
-        transformers.models.qwen2_vl.modeling_qwen2_vl.Qwen2VLModel.forward = adakv_qwen_forward
-        transformers.models.qwen2_vl.modeling_qwen2_vl.Qwen2VLFlashAttention2.forward = qwen_flash_attn2_forward_AdaKV
-
+        _install_qwen2_base_patchset()
     elif method == "sparsemm":
         print("Using SparseMM! 111")
-        transformers.models.qwen2_5_vl.modeling_qwen2_5_vl.Qwen2_5_VLFlashAttention2.forward = qwen_flash_attn2_forward_SparseMM
-        transformers.models.qwen2_5_vl.modeling_qwen2_5_vl.Qwen2_5_VLForConditionalGeneration.forward = forwardllm
-        transformers.models.qwen2_5_vl.modeling_qwen2_5_vl.Qwen2_5_VLModel.forward = adakv_qwen_forward
-        transformers.models.qwen2_5_vl.modeling_qwen2_5_vl.Qwen2_5_VLDecoderLayer.forward = forwarddec
+        _install_qwen25_method_patch(
+            qwen_flash_attn2_forward_SparseMM, model_forward=adakv_qwen_forward
+        )
     elif method == "shiftkv":
         print("Using shiftkv!")  # Dynamic visual-token handling during Qwen forward.
-
-        transformers.models.qwen2_5_vl.modeling_qwen2_5_vl.Qwen2_5_VLFlashAttention2.forward = forward
-        transformers.models.qwen2_5_vl.modeling_qwen2_5_vl.Qwen2_5_VLForConditionalGeneration.forward = forwardllm
-        transformers.models.qwen2_5_vl.modeling_qwen2_5_vl.Qwen2_5_VLModel.forward = forwardllm2
-        transformers.models.qwen2_5_vl.modeling_qwen2_5_vl.Qwen2_5_VLDecoderLayer.forward = forwarddec
-        transformers.models.qwen2_5_vl.modeling_qwen2_5_vl.Qwen2_5_VLFlashAttention2.forward = qwen_flash_attn2_forward_ShiftKV
-        transformers.models.qwen2_5_vl.modeling_qwen2_5_vl.Qwen2_5_VLModel.forward = adakv_qwen_forward
+        _install_qwen25_method_patch(
+            qwen_flash_attn2_forward_ShiftKV, model_forward=adakv_qwen_forward
+        )

@@ -188,11 +188,15 @@ bash scripts/others/speed_and_memory.sh
 MM-ShiftKV/
 ├── assets/        # Figures and visualizations
 ├── csrc/          # CUDA extensions
-├── mmshiftkv/     # Core implementation
+├── mmshift/       # Runtime monkeypatches and method implementations
+├── tools/analysis/# Offline statistics / analysis utilities
 ├── scripts/       # Inference / evaluation scripts
-├── lmms-eval/     # Evaluation framework
+├── lmms_eval/     # Evaluation framework
 └── README.md
 ```
+
+Offline statistics builders were moved under `tools/analysis/`. The legacy
+paths under `mmshift/` are kept as compatibility wrappers.
 
 ---
 

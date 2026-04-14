@@ -7,7 +7,7 @@ import torch
 import transformers
 from torch.nn import CrossEntropyLoss
 
-from mmshift.qwen_model import (
+from mmshift.models.qwen_model import (
     adakv_qwen_forward,
     qwen_flash_attn2_forward_AdaKV,
     qwen_flash_attn2_forward_keydiff,

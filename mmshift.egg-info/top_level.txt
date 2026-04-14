@@ -7,3 +7,6 @@ mmshift
 results
 scripts
 speedmemory
+src
+statistics_table
+visual_head
